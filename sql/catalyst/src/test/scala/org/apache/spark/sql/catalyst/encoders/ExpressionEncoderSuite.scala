@@ -20,17 +20,17 @@ package org.apache.spark.sql.catalyst.encoders
 import java.math.BigInteger
 import java.sql.{Date, Timestamp}
 import java.util.Arrays
-
 import scala.collection.mutable.ArrayBuffer
+
 import scala.reflect.classTag
 import scala.reflect.runtime.universe.TypeTag
 
 import org.apache.spark.{SPARK_DOC_ROOT, SparkArithmeticException, SparkRuntimeException, SparkUnsupportedOperationException}
 import org.apache.spark.sql.{Encoder, Encoders, Row}
-import org.apache.spark.sql.catalyst.{FooClassWithEnum, FooEnum, OptionalData, PrimitiveData, ScroogeLikeExample}
+import org.apache.spark.sql.catalyst.{FooClassWithEnum, FooEnum, OptionalData, PrimitiveData, ScalaReflection, ScroogeLikeExample}
 import org.apache.spark.sql.catalyst.analysis.AnalysisTest
 import org.apache.spark.sql.catalyst.dsl.plans._
-import org.apache.spark.sql.catalyst.encoders.AgnosticEncoders.{BinaryEncoder, TransformingEncoder}
+import org.apache.spark.sql.catalyst.encoders.AgnosticEncoders.{BinaryEncoder, /*EncoderField, ProductEncoder, */TransformingEncoder}
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, NaNvl}
 import org.apache.spark.sql.catalyst.plans.CodegenInterpretedPlanTest
 import org.apache.spark.sql.catalyst.plans.logical.LocalRelation
@@ -140,6 +140,19 @@ case class SeqNestedGeneric[T](list: Seq[T])
 case class OptionNestedGeneric[T](list: Option[T])
 case class MapNestedGenericKey[T](list: Map[T, Int])
 case class MapNestedGenericValue[T](list: Map[Int, T])
+
+// ADT encoding for TransformingEncoder test
+trait Base {
+  def name: String
+}
+
+case class A(name: String, number: Int) extends Base
+
+case class B(name: String, text: String) extends Base
+
+case class Struct(typ: String, name: String, number: Option[Int] = None,
+  text: Option[String] = None)
+// end ADT encoding
 
 class ExpressionEncoderSuite extends CodegenInterpretedPlanTest with AnalysisTest
   with QueryErrorsBase {
@@ -580,6 +593,69 @@ class ExpressionEncoderSuite extends CodegenInterpretedPlanTest with AnalysisTes
   testTransformingEncoder("transforming java serialization encoder", JavaSerializationCodec)
   testTransformingEncoder("transforming kryo encoder", KryoSerializationCodec)
 
+  test("transforming encoders ADT - Frameless Injections use case") {
+    val provider = () => new Codec[Base, Struct]{
+      override def encode(in: Base): Struct = in match {
+        case A(name, number) => Struct("A", name, number = Some(number))
+        case B(name, text) => Struct("B", name, text = Some(text))
+      }
+
+      override def decode(out: Struct): Base = out match {
+        case Struct("A", name, Some(number), None) => A(name, number)
+        case Struct("B", name, None, Some(text)) => B(name, text)
+        case _ => throw new Exception(f"Invalid Base structure {s}")
+      }
+    }
+    val encoder = ExpressionEncoder(TransformingEncoder(
+      classTag[Base],
+      ScalaReflection.encoderFor[Struct],
+      provider))
+      .resolveAndBind()
+
+    val toRow = encoder.createSerializer()
+    val fromRow = encoder.createDeserializer()
+
+    assert(fromRow(toRow(A("anA", 1))) == A("anA", 1))
+    assert(fromRow(toRow(B("aB", "text"))) == B("aB", "text"))
+  }
+
+  test("transforming encoders as value class - Frameless value class as parameter use case") {
+    // works via ExpressionEncoder derivation
+    val v = ValueContainer(2, StringWrapper("b"))
+
+    val agEnc = AgnosticEncoders.agnosticEncoderFor[ValueContainer]
+
+    val provider = () => new Codec[StringWrapper, String]{
+      override def encode(in: StringWrapper): String = in.s
+
+      override def decode(out: String): StringWrapper = StringWrapper(out)
+    }
+    val valueEncoder = TransformingEncoder(
+      classTag[StringWrapper],
+      ScalaReflection.encoderFor[String],
+      provider)
+
+    val clazzEncoder = ExpressionEncoder(agEnc/* ProductEncoder(
+      classTag[ValueContainer],
+      Seq(
+        EncoderField("a", ScalaReflection.encoderFor[Int], nullable = false, Metadata.empty),
+        EncoderField("b", valueEncoder, nullable = false, Metadata.empty)
+      ),
+      None
+    ) */).resolveAndBind()
+
+    assert(clazzEncoder.schema === StructType(
+      Seq(
+        StructField("a", IntegerType, nullable = false),
+        StructField("b", StringType)
+      )
+    ))
+
+    val toRow = clazzEncoder.createSerializer()
+    val fromRow = clazzEncoder.createDeserializer()
+
+    assert(fromRow(toRow(v)) == v)
+  }
   // Scala / Java big decimals ----------------------------------------------------------
 
   encodeDecodeTest(BigDecimal(("9" * 20) + "." + "9" * 18),
