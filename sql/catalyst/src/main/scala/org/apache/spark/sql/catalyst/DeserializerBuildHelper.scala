@@ -461,8 +461,8 @@ object DeserializerBuildHelper {
         "decode",
         ObjectType(tag.runtimeClass),
         createDeserializer(encoder, path, walkedTypePath) :: Nil,
-        propagateNull = encoder.nullable,
-        returnNullable = encoder.nullable
+        propagateNull = enc.nullable,
+        returnNullable = enc.nullable
       )
   }
 

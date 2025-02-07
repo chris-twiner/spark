@@ -19,18 +19,15 @@ package org.apache.spark.sql
 
 import java.io.{Externalizable, ObjectInput, ObjectOutput}
 import java.sql.{Date, Timestamp}
-
 import scala.collection.immutable.HashSet
 import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 import scala.reflect.ClassTag
 import scala.util.Random
-
 import org.apache.hadoop.fs.{Path, PathFilter}
 import org.scalatest.Assertions._
 import org.scalatest.exceptions.TestFailedException
 import org.scalatest.prop.TableDrivenPropertyChecks._
-
 import org.apache.spark.{SparkConf, SparkRuntimeException, SparkUnsupportedOperationException, TaskContext}
 import org.apache.spark.TestUtils.withListener
 import org.apache.spark.internal.config.MAX_RESULT_SIZE
@@ -38,8 +35,8 @@ import org.apache.spark.scheduler.{SparkListener, SparkListenerJobStart}
 import org.apache.spark.sql.catalyst.{FooClassWithEnum, FooEnum, ScroogeLikeExample}
 import org.apache.spark.sql.catalyst.DeserializerBuildHelper.createDeserializerForString
 import org.apache.spark.sql.catalyst.SerializerBuildHelper.createSerializerForString
-import org.apache.spark.sql.catalyst.encoders.{AgnosticEncoders, AgnosticExpressionPathEncoder, ExpressionEncoder, OuterScopes}
-import org.apache.spark.sql.catalyst.encoders.AgnosticEncoders.{BoxedIntEncoder, ProductEncoder}
+import org.apache.spark.sql.catalyst.encoders.{AgnosticEncoders, AgnosticExpressionPathEncoder, Codec, ExpressionEncoder, OuterScopes}
+import org.apache.spark.sql.catalyst.encoders.AgnosticEncoders.{BoxedIntEncoder, EncoderField, IterableEncoder, PrimitiveIntEncoder, ProductEncoder, TransformingEncoder}
 import org.apache.spark.sql.catalyst.expressions.{CodegenObjectFactoryMode, Expression, GenericRowWithSchema}
 import org.apache.spark.sql.catalyst.plans.JoinType
 import org.apache.spark.sql.catalyst.trees.DataFrameQueryContext
@@ -2857,6 +2854,50 @@ class DatasetSuite extends QueryTest
     checkDataset(Seq(arrayMutableSet).toDS(), arrayMutableSet)
     checkDataset(Seq(seqMutableSet).toDS(), seqMutableSet)
     checkDataset(Seq(mapMutableSet).toDS(), mapMutableSet)
+  }
+
+  test("Incorrect derived nullability with TransformingEncoder") {
+    val sparkI = spark
+    type T = Tuple2[Seq[Seq[Int]], Seq[Int]]
+    val data: Seq[T] = Seq( ( Seq( Seq(1, 2, 3) ), Seq(1, 2, 3) ) )
+    val sparkDataTypeOG = {
+      import sparkI.implicits._
+      val ds = spark.createDataset[Tuple2[Seq[Seq[Int]], Seq[Int]]](data)
+      ds.schema
+    }
+
+    val provider = () =>
+      new Codec[Seq[Int], Seq[Int]]{
+        override def encode(in: Seq[Int]): Seq[Int] = in
+        override def decode(out: Seq[Int]): Seq[Int] = out
+      }
+
+    val transformingSeq =
+      TransformingEncoder[Seq[Int], Seq[Int]](
+        implicitly[ClassTag[Seq[Int]]],
+        IterableEncoder[Seq[Int], Int](implicitly[ClassTag[Seq[Int]]],
+          PrimitiveIntEncoder, false, false),
+        provider
+      )
+
+    val enc =
+      ProductEncoder(
+        implicitly[ClassTag[T]],
+        Seq(
+          EncoderField("_1",
+            IterableEncoder[Seq[Seq[Int]], Seq[Int]](implicitly[ClassTag[Seq[Seq[Int]]]],
+              transformingSeq, false, false), false, Metadata.empty),
+          EncoderField( "_2", transformingSeq, false, Metadata.empty)
+        ),
+        None
+      )
+    val sparkViaAgnostic = {
+      val ds = spark.createDataset(data)(enc)
+      ds.schema
+    }
+    // the nullability without TransformingEncoder nullability (SerializerBuilderHelper)
+    // is incorrect (_2 is inferred as nullable)
+    assert(enc.dataType === sparkViaAgnostic)
   }
 }
 
