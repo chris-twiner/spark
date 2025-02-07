@@ -430,7 +430,10 @@ object SerializerBuildHelper {
         Literal(codecProvider(), ObjectType(classOf[Codec[_, _]])),
         "encode",
         externalDataTypeFor(encoder),
-        input :: Nil)
+        input :: Nil,
+        propagateNull = input.nullable,
+        returnNullable = input.nullable
+      )
       createSerializer(encoder, encoded)
   }
 

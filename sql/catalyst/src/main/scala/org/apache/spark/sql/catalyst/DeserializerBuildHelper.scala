@@ -460,7 +460,10 @@ object DeserializerBuildHelper {
         Literal.create(provider(), ObjectType(classOf[Codec[_, _]])),
         "decode",
         ObjectType(tag.runtimeClass),
-        createDeserializer(encoder, path, walkedTypePath) :: Nil)
+        createDeserializer(encoder, path, walkedTypePath) :: Nil,
+        propagateNull = encoder.nullable,
+        returnNullable = encoder.nullable
+      )
   }
 
   private def deserializeArray(
