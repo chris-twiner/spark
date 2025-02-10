@@ -19,15 +19,18 @@ package org.apache.spark.sql
 
 import java.io.{Externalizable, ObjectInput, ObjectOutput}
 import java.sql.{Date, Timestamp}
+
 import scala.collection.immutable.HashSet
 import scala.collection.mutable
 import scala.jdk.CollectionConverters._
-import scala.reflect.ClassTag
+import scala.reflect.{classTag, ClassTag}
 import scala.util.Random
+
 import org.apache.hadoop.fs.{Path, PathFilter}
 import org.scalatest.Assertions._
 import org.scalatest.exceptions.TestFailedException
 import org.scalatest.prop.TableDrivenPropertyChecks._
+
 import org.apache.spark.{SparkConf, SparkRuntimeException, SparkUnsupportedOperationException, TaskContext}
 import org.apache.spark.TestUtils.withListener
 import org.apache.spark.internal.config.MAX_RESULT_SIZE
@@ -35,9 +38,10 @@ import org.apache.spark.scheduler.{SparkListener, SparkListenerJobStart}
 import org.apache.spark.sql.catalyst.{FooClassWithEnum, FooEnum, ScroogeLikeExample}
 import org.apache.spark.sql.catalyst.DeserializerBuildHelper.createDeserializerForString
 import org.apache.spark.sql.catalyst.SerializerBuildHelper.createSerializerForString
-import org.apache.spark.sql.catalyst.encoders.{AgnosticEncoders, AgnosticExpressionPathEncoder, Codec, ExpressionEncoder, OuterScopes}
-import org.apache.spark.sql.catalyst.encoders.AgnosticEncoders.{BoxedIntEncoder, EncoderField, IterableEncoder, PrimitiveIntEncoder, ProductEncoder, TransformingEncoder}
+import org.apache.spark.sql.catalyst.encoders.{AgnosticEncoder, AgnosticEncoders, AgnosticExpressionPathEncoder, Codec, ExpressionEncoder, OuterScopes}
+import org.apache.spark.sql.catalyst.encoders.AgnosticEncoders.{BoxedIntEncoder, EncoderField, IterableEncoder, OptionEncoder, PrimitiveIntEncoder, ProductEncoder, TransformingEncoder}
 import org.apache.spark.sql.catalyst.expressions.{CodegenObjectFactoryMode, Expression, GenericRowWithSchema}
+import org.apache.spark.sql.catalyst.expressions.CodegenObjectFactoryMode.NO_CODEGEN
 import org.apache.spark.sql.catalyst.plans.JoinType
 import org.apache.spark.sql.catalyst.trees.DataFrameQueryContext
 import org.apache.spark.sql.catalyst.util.sideBySide
@@ -2856,10 +2860,12 @@ class DatasetSuite extends QueryTest
     checkDataset(Seq(mapMutableSet).toDS(), mapMutableSet)
   }
 
-  test("Incorrect derived nullability with TransformingEncoder") {
+  // below tests are related to SPARK-49960 and TransformingEncoder usage
+  test("Incorrect derived nullability with TransformingEncoder - non nullable") {
     val sparkI = spark
     type T = Tuple2[Seq[Seq[Int]], Seq[Int]]
     val data: Seq[T] = Seq( ( Seq( Seq(1, 2, 3) ), Seq(1, 2, 3) ) )
+    // for reference only
     val sparkDataTypeOG = {
       import sparkI.implicits._
       val ds = spark.createDataset[Tuple2[Seq[Seq[Int]], Seq[Int]]](data)
@@ -2898,6 +2904,127 @@ class DatasetSuite extends QueryTest
     // the nullability without TransformingEncoder nullability (SerializerBuilderHelper)
     // is incorrect (_2 is inferred as nullable)
     assert(enc.dataType === sparkViaAgnostic)
+  }
+
+  def provider[A]: () => Codec[V[A], A] = () =>
+    new Codec[V[A], A]{
+      override def encode(in: V[A]): A = in.v
+      override def decode(out: A): V[A] = V(out)
+    }
+
+  def transforming[A](underlying: AgnosticEncoder[A]): TransformingEncoder[V[A], A] =
+    TransformingEncoder[V[A], A](
+      implicitly[ClassTag[V[A]]],
+      underlying,
+      provider
+    )
+
+  // "value" usage for single field, a wrapping nullable type is required
+  val OPTION_OF_V_INT = StructType(Seq(StructField("value", StructType(Seq(
+    StructField("v", IntegerType, nullable = false))), nullable = true)))
+
+  // product encoder for a non-nullable V
+  val V_OF_INT =
+    ProductEncoder(
+      classTag[V[Int]],
+      Seq(EncoderField("v", PrimitiveIntEncoder, nullable = false, Metadata.empty)),
+      None
+    )
+
+  test("""Encoder derivation with nested TransformingEncoder of OptionEncoder""".stripMargin) {
+    val sparkI = spark
+    type T = V[V[Option[V[Int]]]]
+    val data: Seq[T] = Seq(V(V(None)), V(V(Some(V(1)))))
+    // for reference - datatype will introduce nested classes as expected
+    val sparkDataTypeOG = {
+      import sparkI.implicits._
+      val ds = spark.createDataset[V[V[Option[V[Int]]]]](data)
+      ds.schema
+    }
+
+    /* attempt to behave as if value class semantics except the last product,
+      using a final transforming instead of a product serializes */
+    val enc =
+      transforming(
+        transforming(
+          OptionEncoder(
+            // works
+            // transforming(PrimitiveIntEncoder)
+            // does not work
+            V_OF_INT
+          )
+        )
+      )
+
+    assert(enc.schema === OPTION_OF_V_INT)
+
+    val codeGenFactoryMode = NO_CODEGEN
+
+    /* interpreted fails on serialization with None becoming Some(V(0)),
+      compilation does not as no state is captured by invoke, only statics can be invoked
+     */
+    withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false",
+      SQLConf.CODEGEN_FACTORY_MODE.key -> codeGenFactoryMode.toString) {
+      val sparkViaAgnostic = {
+        val ds = spark.createDataset(data)(enc)
+        ds.show()
+        ds.schema
+      }
+
+      /* The schema has been changed to just the Product V[Int], the wrapping Option value
+          struct has been removed - it should not have been */
+      assert(sparkViaAgnostic === enc.schema)
+
+      val ds = spark.createDataset(data)(enc)
+      assert(ds.collect().toVector === data.toVector)
+    }
+  }
+
+  test("""Encoder derivation with TransformingEncoder of OptionEncoder""".stripMargin) {
+    val sparkI = spark
+    type T = V[Option[V[Int]]]
+    val data: Seq[T] = Seq(V(None), V(Some(V(1))))
+    // for reference - datatype will introduce nested classes as expected
+    val sparkDataTypeOG = {
+      import sparkI.implicits._
+      val ds = spark.createDataset[V[Option[V[Int]]]](data)
+      ds.schema
+    }
+
+    /* attempt to behave as if value class semantics except the last product,
+      using a final transforming instead of a product serializes */
+    val enc =
+      transforming(
+        OptionEncoder(
+          // works
+          // transforming(PrimitiveIntEncoder)
+          // does not work
+          V_OF_INT
+        )
+      )
+
+    assert(enc.schema === OPTION_OF_V_INT)
+
+    val codeGenFactoryMode = NO_CODEGEN
+
+    /* interpreted fails on serialization with None becoming Some(V(0)),
+      compilation does not as no state is captured by invoke, only statics can be invoked
+     */
+    withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false",
+      SQLConf.CODEGEN_FACTORY_MODE.key -> codeGenFactoryMode.toString) {
+      val sparkViaAgnostic = {
+        val ds = spark.createDataset(data)(enc)
+        ds.show()
+        ds.schema
+      }
+
+      /* The schema has been changed to just the Product V[Int], the wrapping Option value
+          struct has been removed - it should not have been */
+      assert(sparkViaAgnostic === enc.schema)
+
+      val ds = spark.createDataset(data)(enc)
+      assert(ds.collect().toVector === data.toVector)
+    }
   }
 }
 
@@ -3074,3 +3201,5 @@ case class SaveModeArrayCase(modes: Array[SaveMode])
 
 case class K1(a: Long)
 case class K2(a: Long, b: Long)
+
+case class V[A](v: A)
