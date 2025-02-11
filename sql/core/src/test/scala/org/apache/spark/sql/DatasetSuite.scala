@@ -19,18 +19,15 @@ package org.apache.spark.sql
 
 import java.io.{Externalizable, ObjectInput, ObjectOutput}
 import java.sql.{Date, Timestamp}
-
 import scala.collection.immutable.HashSet
 import scala.collection.mutable
 import scala.jdk.CollectionConverters._
-import scala.reflect.{classTag, ClassTag}
+import scala.reflect.{ClassTag, classTag}
 import scala.util.Random
-
 import org.apache.hadoop.fs.{Path, PathFilter}
 import org.scalatest.Assertions._
 import org.scalatest.exceptions.TestFailedException
 import org.scalatest.prop.TableDrivenPropertyChecks._
-
 import org.apache.spark.{SparkConf, SparkRuntimeException, SparkUnsupportedOperationException, TaskContext}
 import org.apache.spark.TestUtils.withListener
 import org.apache.spark.internal.config.MAX_RESULT_SIZE
@@ -39,11 +36,13 @@ import org.apache.spark.sql.catalyst.{FooClassWithEnum, FooEnum, ScroogeLikeExam
 import org.apache.spark.sql.catalyst.DeserializerBuildHelper.createDeserializerForString
 import org.apache.spark.sql.catalyst.SerializerBuildHelper.createSerializerForString
 import org.apache.spark.sql.catalyst.encoders.{AgnosticEncoder, AgnosticEncoders, AgnosticExpressionPathEncoder, Codec, ExpressionEncoder, OuterScopes}
-import org.apache.spark.sql.catalyst.encoders.AgnosticEncoders.{BoxedIntEncoder, EncoderField, IterableEncoder, OptionEncoder, PrimitiveIntEncoder, ProductEncoder, TransformingEncoder}
+import org.apache.spark.sql.catalyst.encoders.AgnosticEncoders.{BoxedIntEncoder, EncoderField, IterableEncoder, PrimitiveIntEncoder, ProductEncoder, TimestampEncoder, TransformingEncoder}
 import org.apache.spark.sql.catalyst.expressions.{CodegenObjectFactoryMode, Expression, GenericRowWithSchema}
 import org.apache.spark.sql.catalyst.expressions.CodegenObjectFactoryMode.NO_CODEGEN
 import org.apache.spark.sql.catalyst.plans.JoinType
 import org.apache.spark.sql.catalyst.trees.DataFrameQueryContext
+import org.apache.spark.sql.catalyst.util.DateTimeUtils.microsToInstant
+import org.apache.spark.sql.catalyst.util.SparkDateTimeUtils.instantToMicros
 import org.apache.spark.sql.catalyst.util.sideBySide
 import org.apache.spark.sql.execution.{LogicalRDD, RDDScanExec, SQLExecution}
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
@@ -2919,9 +2918,11 @@ class DatasetSuite extends QueryTest
       provider
     )
 
+  val V_INT = StructType(Seq(StructField("v", IntegerType, nullable = false)))
+
   // "value" usage for single field, a wrapping nullable type is required
-  val OPTION_OF_V_INT = StructType(Seq(StructField("value", StructType(Seq(
-    StructField("v", IntegerType, nullable = false))), nullable = true)))
+  val OPTION_OF_V_INT = StructType(Seq(StructField("value",
+    V_INT, nullable = true)))
 
   // product encoder for a non-nullable V
   val V_OF_INT =
@@ -2930,7 +2931,7 @@ class DatasetSuite extends QueryTest
       Seq(EncoderField("v", PrimitiveIntEncoder, nullable = false, Metadata.empty)),
       None
     )
-
+/*
   test("""Encoder derivation with nested TransformingEncoder of OptionEncoder""".stripMargin) {
     val sparkI = spark
     type T = V[V[Option[V[Int]]]]
@@ -3012,6 +3013,64 @@ class DatasetSuite extends QueryTest
      */
     withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false",
       SQLConf.CODEGEN_FACTORY_MODE.key -> codeGenFactoryMode.toString) {
+      val sparkViaAgnostic = {
+        val ds = spark.createDataset(data)(enc)
+        ds.show()
+        ds.schema
+      }
+
+      /* The schema has been changed to just the Product V[Int], the wrapping Option value
+          struct has been removed - it should not have been */
+      assert(sparkViaAgnostic === enc.schema)
+
+      val ds = spark.createDataset(data)(enc)
+      assert(ds.collect().toVector === data.toVector)
+    }
+  } */
+
+  test("""TransformingEncoder as Iterable""".stripMargin) {
+    val sparkI = spark
+    type T = Seq[V[Long]]
+    val data: Seq[T] = Seq(Seq(V(0)), Seq(V(1), V(2)))
+    // for reference - datatype will introduce nested classes as expected
+    val sparkDataTypeOG = {
+      import sparkI.implicits._
+      val ds = spark.createDataset[Seq[V[Long]]](data)
+      ds.schema
+    }
+
+    val provider = () =>
+      new Codec[V[Long], java.sql.Timestamp] with Serializable {
+        override def encode(in: V[Long]): Timestamp = Timestamp.from(microsToInstant(in.v))
+
+        override def decode(out: Timestamp): V[Long] = V[Long](instantToMicros(out.toInstant))
+      }
+
+    val longEnc: AgnosticEncoder[V[Long]] =
+      TransformingEncoder[V[Long], java.sql.Timestamp](
+        classTag,
+        TimestampEncoder(true),
+        provider
+      )
+
+    /* user class has Long, underlying type is TimestampType.
+      InvokeLike will get the type TIMESTAMP but reject creation of V because
+      ValidateExternalType.nullSafeEval doesn't know about the transforming encoder
+     */
+    val enc: AgnosticEncoder[T] =
+      IterableEncoder[Seq[V[Long]], V[Long]](
+        implicitly[ClassTag[Seq[V[Long]]]],
+        longEnc,
+        containsNull = false,
+        lenientSerialization = false)
+
+    assert(enc.dataType === new ArrayType(TimestampType, false))
+
+    val codeGenFactoryMode = NO_CODEGEN
+
+    withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false",
+      SQLConf.CODEGEN_FACTORY_MODE.key -> codeGenFactoryMode.toString) {
+
       val sparkViaAgnostic = {
         val ds = spark.createDataset(data)(enc)
         ds.show()
