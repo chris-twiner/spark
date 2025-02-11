@@ -490,6 +490,7 @@ object SerializerBuildHelper {
       nullable: Boolean): Expression => Expression = { input =>
     val expected = enc match {
       case OptionEncoder(_) => lenientExternalDataTypeFor(enc)
+      case TransformingEncoder(_, transformed, _) => lenientExternalDataTypeFor(transformed)
       case _ => enc.dataType
     }
 
