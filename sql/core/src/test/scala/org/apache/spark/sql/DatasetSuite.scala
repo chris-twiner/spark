@@ -39,7 +39,7 @@ import org.apache.spark.sql.catalyst.{FooClassWithEnum, FooEnum, ScroogeLikeExam
 import org.apache.spark.sql.catalyst.DeserializerBuildHelper.createDeserializerForString
 import org.apache.spark.sql.catalyst.SerializerBuildHelper.createSerializerForString
 import org.apache.spark.sql.catalyst.encoders.{AgnosticEncoder, AgnosticEncoders, AgnosticExpressionPathEncoder, Codec, ExpressionEncoder, OuterScopes}
-import org.apache.spark.sql.catalyst.encoders.AgnosticEncoders.{BoxedIntEncoder, EncoderField, IterableEncoder, MapEncoder, PrimitiveIntEncoder, ProductEncoder, TimestampEncoder, TransformingEncoder}
+import org.apache.spark.sql.catalyst.encoders.AgnosticEncoders.{BoxedIntEncoder, EncoderField, IterableEncoder, MapEncoder, OptionEncoder, PrimitiveIntEncoder, ProductEncoder, TimestampEncoder, TransformingEncoder}
 import org.apache.spark.sql.catalyst.expressions.{CodegenObjectFactoryMode, Expression, GenericRowWithSchema}
 import org.apache.spark.sql.catalyst.plans.JoinType
 import org.apache.spark.sql.catalyst.trees.DataFrameQueryContext
@@ -2933,7 +2933,7 @@ class DatasetSuite extends QueryTest
       Seq(EncoderField("v", PrimitiveIntEncoder, nullable = false, Metadata.empty)),
       None
     )
-/*
+
   test("""Encoder derivation with nested TransformingEncoder of OptionEncoder""".stripMargin) {
     val sparkI = spark
     type T = V[V[Option[V[Int]]]]
@@ -2961,26 +2961,17 @@ class DatasetSuite extends QueryTest
 
     assert(enc.schema === OPTION_OF_V_INT)
 
-    val codeGenFactoryMode = NO_CODEGEN
-
-    /* interpreted fails on serialization with None becoming Some(V(0)),
-      compilation does not as no state is captured by invoke, only statics can be invoked
-     */
-    withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false",
-      SQLConf.CODEGEN_FACTORY_MODE.key -> codeGenFactoryMode.toString) {
-      val sparkViaAgnostic = {
-        val ds = spark.createDataset(data)(enc)
-        ds.show()
-        ds.schema
-      }
-
-      /* The schema has been changed to just the Product V[Int], the wrapping Option value
-          struct has been removed - it should not have been */
-      assert(sparkViaAgnostic === enc.schema)
-
+    val sparkViaAgnostic = {
       val ds = spark.createDataset(data)(enc)
-      assert(ds.collect().toVector === data.toVector)
+      ds.schema
     }
+
+    /* The schema has been changed to just the Product V[Int], the wrapping Option value
+        struct has been removed - it should not have been */
+    assert(sparkViaAgnostic === enc.schema)
+
+    val ds = spark.createDataset(data)(enc)
+    assert(ds.collect().toVector === data.toVector)
   }
 
   test("""Encoder derivation with TransformingEncoder of OptionEncoder""".stripMargin) {
@@ -3008,27 +2999,18 @@ class DatasetSuite extends QueryTest
 
     assert(enc.schema === OPTION_OF_V_INT)
 
-    val codeGenFactoryMode = NO_CODEGEN
-
-    /* interpreted fails on serialization with None becoming Some(V(0)),
-      compilation does not as no state is captured by invoke, only statics can be invoked
-     */
-    withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false",
-      SQLConf.CODEGEN_FACTORY_MODE.key -> codeGenFactoryMode.toString) {
-      val sparkViaAgnostic = {
-        val ds = spark.createDataset(data)(enc)
-        ds.show()
-        ds.schema
-      }
-
-      /* The schema has been changed to just the Product V[Int], the wrapping Option value
-          struct has been removed - it should not have been */
-      assert(sparkViaAgnostic === enc.schema)
-
+    val sparkViaAgnostic = {
       val ds = spark.createDataset(data)(enc)
-      assert(ds.collect().toVector === data.toVector)
+      ds.schema
     }
-  } */
+
+    /* The schema has been changed to just the Product V[Int], the wrapping Option value
+        struct has been removed - it should not have been */
+    assert(sparkViaAgnostic === enc.schema)
+
+    val ds = spark.createDataset(data)(enc)
+    assert(ds.collect().toVector === data.toVector)
+  }
 
   val longEncForTimestamp: AgnosticEncoder[V[Long]] =
     TransformingEncoder[V[Long], java.sql.Timestamp](
@@ -3065,7 +3047,6 @@ class DatasetSuite extends QueryTest
 
     val sparkViaAgnostic = {
       val ds = spark.createDataset(data)(enc)
-      ds.show()
       ds.schema
     }
 
@@ -3098,7 +3079,6 @@ class DatasetSuite extends QueryTest
 
     val sparkViaAgnostic = {
       val ds = spark.createDataset(data)(enc)
-      ds.show()
       ds.schema
     }
 
